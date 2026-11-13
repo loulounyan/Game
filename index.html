@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>寸止め指示ゲーム</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #111;
+      color: #eee;
+      padding: 20px;
+      max-width: 500px;
+      margin: 0 auto;
+      min-height: 100vh;
+    }
+    h1 { text-align: center; margin-bottom: 20px; font-size: 1.5rem; }
+    .card {
+      background: #1e1e1e;
+      border-radius: 16px;
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+    label { display: block; margin-bottom: 6px; font-size: 0.9rem; color: #aaa; }
+    input, select, button, textarea {
+      width: 100%;
+      padding: 12px;
+      border-radius: 10px;
+      border: none;
+      font-size: 1rem;
+      margin-bottom: 12px;
+    }
+    input, select, textarea { background: #333; color: #fff; }
+    button {
+      background: #e63946;
+      color: white;
+      font-weight: bold;
+      cursor: pointer;
+    }
+    button:disabled { background: #555; }
+    #timer {
+      font-size: 3rem;
+      text-align: center;
+      font-weight: bold;
+      margin: 20px 0;
+    }
+    #instruction {
+      min-height: 120px;
+      background: #222;
+      border-radius: 12px;
+      padding: 16px;
+      white-space: pre-wrap;
+      line-height: 1.6;
+      margin-bottom: 12px;
+      font-size: 1.05rem;
+    }
+    .status { text-align: center; font-size: 0.85rem; color: #888; margin-top: 8px; }
+    .row { display: flex; gap: 10px; }
+    .row > * { flex: 1; }
+  </style>
+</head>
+<body>
+  <h1>寸止め指示ゲーム</h1>
+
+  <div class="card">
+    <label>Gemini APIキー（初回だけ入力）</label>
+    <input type="password" id="apiKey" placeholder="AIza... を貼り付け">
+    <button onclick="saveKey()">キーを保存</button>
+  </div>
+
+  <div class="card">
+    <div id="timer">00:00</div>
+    <div class="row">
+      <button id="startBtn" onclick="toggleTimer()">スタート</button>
+      <button onclick="resetTimer()">リセット</button>
+    </div>
+    <label>刺激の強さ</label>
+    <input type="range" id="intensity" min="1" max="10" value="5">
+    <div style="text-align:center; margin-bottom:12px;" id="intensityValue">5</div>
+  </div>
+
+  <div class="card">
+    <div id="instruction">ここに指示が出ます</div>
+    <button id="genBtn" onclick="generateInstruction()">指示を生成</button>
+    <button onclick="speak()">音声で読む</button>
+    <div class="status" id="status">準備完了</div>
+  </div>
+
+  <script type="module">
+    // ========== 設定 ==========
+    // 日本語に比較的強い小型モデル
+    const MODEL_ID = "Qwen2.5-0.5B-Instruct-q4f16_1-MLC";
+    // ========================
+
+    let engine = null;
+    let isLocalReady = false;
+    let timerInterval = null;
+    let seconds = 0;
+    let isRunning = false;
+
+    // キー保存
+    window.saveKey = () => {
+      const key = document.getElementById("apiKey").value.trim();
+      if (key) {
+        localStorage.setItem("gemini_key", key);
+        document.getElementById("apiKey").value = "";
+        document.getElementById("apiKey").placeholder = "キーは保存済みです";
+        alert("保存しました");
+      }
+    };
+
+    // 強度表示
+    document.getElementById("intensity").oninput = (e) => {
+      document.getElementById("intensityValue").textContent = e.target.value;
+    };
+
+    // タイマー
+    window.toggleTimer = () => {
+      if (isRunning) {
+        clearInterval(timerInterval);
+        document.getElementById("startBtn").textContent = "スタート";
+        isRunning = false;
+      } else {
+        timerInterval = setInterval(() => {
+          seconds++;
+          const m = String(Math.floor(seconds / 60)).padStart(2, "0");
+          const s = String(seconds % 60).padStart(2, "0");
+          document.getElementById("timer").textContent = `${m}:${s}`;
+        }, 1000);
+        document.getElementById("startBtn").textContent = "ストップ";
+        isRunning = true;
+      }
+    };
+
+    window.resetTimer = () => {
+      clearInterval(timerInterval);
+      seconds = 0;
+      document.getElementById("timer").textContent = "00:00";
+      document.getElementById("startBtn").textContent = "スタート";
+      isRunning = false;
+    };
+
+    // 音声読み上げ
+    window.speak = () => {
+      const text = document.getElementById("instruction").textContent;
+      if (!text || text === "ここに指示が出ます") return;
+      const uttr = new SpeechSynthesisUtterance(text);
+      uttr.lang = "ja-JP";
+      uttr.rate = 0.9;
+      speechSynthesis.cancel(); // 前の音声を止める
+      speechSynthesis.speak(uttr);
+    };
+
+    // ステータス更新
+    function setStatus(msg) {
+      document.getElementById("status").textContent = msg;
+    }
+
+    // WebLLM初期化（バックグラウンド）
+    async function initLocal() {
+      try {
+        setStatus("ローカルモデルを準備中...");
+        const { CreateMLCEngine } = await import("https://esm.run/@mlc-ai/web-llm");
+        engine = await CreateMLCEngine(MODEL_ID, {
+          initProgressCallback: (p) => {
+            if (p.progress) {
+              setStatus(`ローカル準備中 ${Math.round(p.progress * 100)}%`);
+            }
+          }
+        });
+        isLocalReady = true;
+        setStatus("ローカルモデル準備完了（オフライン可）");
+      } catch (e) {
+        console.error(e);
+        setStatus("ローカルモデル準備失敗（クラウドのみ使用）");
+      }
+    }
+
+    // 指示生成（ハイブリッド）
+    window.generateInstruction = async () => {
+      const btn = document.getElementById("genBtn");
+      btn.disabled = true;
+      setStatus("生成中...");
+
+      const intensity = document.getElementById("intensity").value;
+      const timeStr = document.getElementById("timer").textContent;
+
+      // ★ 強く日本語を強制したプロンプト
+      const prompt = `あなたは寸止め（エッジング）専門の厳しい指導者です。
+
+現在の情報：
+- 経過時間: ${timeStr}
+- 刺激の強さ: ${intensity}/10
+
+【絶対守るルール】
+1. 必ず自然で正しい日本語だけで答えること
+2. 意味不明な文章・変な漢字・英語混じりは絶対禁止
+3. 命令調で、直接的でエロい指示を出すこと
+4. 30〜60秒間やることを具体的に短く指示すること
+5. 「〜しなさい」「〜するな」などの強い命令形を使うこと
+
+例：
+「今すぐ手の動きを遅くして、亀頭だけを優しく擦り続けなさい。イキそうになったら完全に止めろ。」
+
+上記のルールをすべて守って、今の状況に合った指示を1つだけ出してください。`;
+
+      let result = "";
+
+      // 1. まずGemini（クラウド）を試す
+      const apiKey = localStorage.getItem("gemini_key");
+      if (apiKey && navigator.onLine) {
+        try {
+          const res = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${apiKey}`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                contents: [{ parts: [{ text: prompt }] }],
+                generationConfig: {
+                  temperature: 0.75,
+                  maxOutputTokens: 200
+                }
+              })
+            }
+          );
+          const data = await res.json();
+          result = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+          if (result) setStatus("Geminiで生成しました");
+        } catch (e) {
+          console.warn("Gemini失敗", e);
+        }
+      }
+
+      // 2. クラウド失敗 or オフラインならローカル
+      if (!result && isLocalReady && engine) {
+        try {
+          setStatus("ローカルモデルで生成中...");
+          const reply = await engine.chat.completions.create({
+            messages: [{ role: "user", content: prompt }],
+            temperature: 0.7,
+            max_tokens: 150
+          });
+          result = reply.choices[0].message.content;
+          setStatus("ローカルモデルで生成しました");
+        } catch (e) {
+          console.error(e);
+          result = "生成に失敗しました。もう一度試してください。";
+        }
+      }
+
+      if (!result) {
+        result = "APIキーが未設定か、ネットもローカルも使えません。\n上の欄にGemini APIキーを入力して保存してください。";
+        setStatus("エラー");
+      }
+
+      document.getElementById("instruction").textContent = result.trim();
+      btn.disabled = false;
+    };
+
+    // 起動時
+    window.addEventListener("load", () => {
+      if (localStorage.getItem("gemini_key")) {
+        document.getElementById("apiKey").placeholder = "キーは保存済みです";
+      }
+      initLocal(); // バックグラウンドでローカルモデルを準備
+    });
+  </script>
+</body>
+</html>
